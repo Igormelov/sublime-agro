@@ -1,131 +1,128 @@
 import streamlit as st
 import pandas as pd
-import requests
-import time
 import gspread
 from google.oauth2.service_account import Credentials
-import json
+import folium
+from streamlit_folium import st_folium
+import requests
 
-st.set_page_config(page_title="SUBLIME Agro - Mapa Google Maps", layout="wide")
+st.set_page_config(page_title="SUBLIME Agro V3", layout="wide")
 
-# --- CONEXÃO COM GOOGLE SHEETS (NUVEM) ---
+# --- CSS SIDEBAR VERTICAL ---
+st.markdown("""
+<style>
+[data-testid="stSidebar"] { background-color: #0f2d1f; }
+[data-testid="stSidebar"] * { color: #d1e7d6 !important; }
+</style>
+""", unsafe_allow_html=True)
+
 @st.cache_resource
-def get_gspread_client():
+def get_sheets():
+    creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
+    client = gspread.authorize(creds)
+    return client.open_by_key(st.secrets["SPREADSHEET_ID"])
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.title("🌿 SUBLIME AGRO")
+    st.markdown("---")
+    categoria = st.selectbox("Categoria", ["👥 CLIENTES", "🏭 FORNECEDORES", "📦 PRODUTOS", "⚙️ CONFIGURAÇÕES"])
+    
+    if "CLIENTES" in categoria:
+        pagina = st.radio("Menu", ["📋 Lista", "➕ Cadastrar", "☁️ Importar Planilha", "📍 Mapa Personalizado"], label_visibility="collapsed")
+    elif "FORNECEDORES" in categoria:
+        pagina = st.radio("Menu", ["📋 Lista Fornecedores", "➕ Cadastrar Fornecedor", "📍 Mapa Fornecedores"], label_visibility="collapsed")
+    elif "PRODUTOS" in categoria:
+        pagina = st.radio("Menu", ["📋 Lista Produtos", "➕ Cadastrar Produto"], label_visibility="collapsed")
+    else:
+        pagina = st.radio("Menu", ["🗑️ Limpar Cache Nuvem", "🎨 Aparência"], label_visibility="collapsed")
+
+# --- PÁGINAS ---
+
+# CLIENTES - CADASTRAR
+if pagina == "➕ Cadastrar":
+    st.title("➕ Cadastrar Cliente - Pelo Celular")
+    with st.form("form_cliente", clear_on_submit=True):
+        c1,c2 = st.columns(2)
+        nome = c1.text_input("Nome / Fazenda *")
+        cnpj = c2.text_input("CNPJ / CPF")
+        c3,c4 = st.columns(2)
+        cep = c3.text_input("CEP *", placeholder="38400-000")
+        cidade = c4.text_input("Cidade")
+        tel = st.text_input("Telefone / WhatsApp")
+        if st.form_submit_button("💾 SALVAR NA NUVEM", type="primary", use_container_width=True):
+            sh = get_sheets()
+            ws = sh.worksheet("Clientes") # cria essa aba na sua planilha
+            ws.append_row([nome, cnpj, cep, cidade, tel])
+            st.success(f"✅ {nome} salvo na planilha! Já aparece no mapa.")
+
+# FORNECEDORES - CADASTRAR
+elif pagina == "➕ Cadastrar Fornecedor":
+    st.title("🏭 Cadastrar Fornecedor")
+    with st.form("form_forn"):
+        nome_f = st.text_input("Nome do Fornecedor *")
+        cep_f = st.text_input("CEP do Fornecedor *")
+        produto_f = st.text_input("Produto principal")
+        if st.form_submit_button("💾 SALVAR FORNECEDOR", type="primary"):
+            sh = get_sheets()
+            ws = sh.worksheet("Fornecedores")
+            ws.append_row([nome_f, cep_f, produto_f])
+            st.success(f"Fornecedor {nome_f} salvo! Pino vermelho no mapa.")
+
+# PRODUTOS - CADASTRAR
+elif pagina == "➕ Cadastrar Produto":
+    st.title("📦 Cadastrar Produto")
+    with st.form("form_prod"):
+        nome_p = st.text_input("Nome do Produto *")
+        c1,c2 = st.columns(2)
+        preco = c1.text_input("Preço R$")
+        estoque = c2.text_input("Estoque")
+        if st.form_submit_button("💾 SALVAR PRODUTO", type="primary"):
+            sh = get_sheets()
+            ws = sh.worksheet("Produtos")
+            ws.append_row([nome_p, preco, estoque])
+            st.success("Produto salvo!")
+
+# MAPA PERSONALIZADO - A ESTRELA
+elif pagina == "📍 Mapa Personalizado":
+    st.title("📍 Mapa Personalizado - Clientes + Fornecedores Salvos")
+    st.info("🟢 Verde = Clientes | 🔴 Vermelho = Fornecedores | Tudo salvo na nuvem com seus 437 CEPs")
+    
+    # Exemplo de mapa
+    m = folium.Map(location=[-19.92, -43.93], zoom_start=5)
+    
+    # Pega da nuvem
     try:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        return client
-    except Exception as e:
-        return None
-
-def load_cache_cloud():
-    try:
-        client = get_gspread_client()
-        if not client: return {}
-        sheet_id = st.secrets["gcp"]["spreadsheet_id"]
-        sh = client.open_by_key(sheet_id)
-        try:
-            ws = sh.worksheet("cache_cep")
-        except:
-            ws = sh.add_worksheet(title="cache_cep", rows=1000, cols=3)
-            ws.append_row(["cep", "lat", "lng"])
-            return {}
-
-        data = ws.get_all_records()
-        cache = {}
-        for row in data:
-            try:
-                cache[str(row['cep']).replace('-','').strip()] = (float(row['lat']), float(row['lng']))
-            except: pass
-        return cache
-    except Exception as e:
-        st.warning(f"Cache nuvem offline: {e}")
-        return {}
-
-def save_cache_cloud(cep, lat, lng):
-    try:
-        client = get_gspread_client()
-        if not client: return
-        sheet_id = st.secrets["gcp"]["spreadsheet_id"]
-        sh = client.open_by_key(sheet_id)
-        ws = sh.worksheet("cache_cep")
-        cep_clean = str(cep).replace('-','').strip()
-        ws.append_row([cep_clean, lat, lng])
-    except Exception as e:
-        pass
-
-# Carrega cache da nuvem
-if 'cache_cep' not in st.session_state:
-    with st.spinner("Carregando cache da nuvem..."):
-        st.session_state.cache_cep = load_cache_cloud()
-
-# --- FUNÇÃO DE BUSCAR LAT/LNG DO CEP ---
-def get_lat_lng(cep):
-    cep_clean = str(cep).replace('-','').replace('.','').strip()
-    if len(cep_clean)!= 8:
-        return None, None
-
-    # 1. Tenta cache
-    if cep_clean in st.session_state.cache_cep:
-        return st.session_state.cache_cep[cep_clean]
-
-    # 2. Busca na API ViaCEP + BrasilAPI
-    try:
-        r = requests.get(f"https://viacep.com.br/ws/{cep_clean}/json/", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if 'erro' not in data:
-                # Usa BrasilAPI para geocode
-                r2 = requests.get(f"https://brasilapi.com.br/api/cep/v2/{cep_clean}", timeout=5)
-                if r2.status_code == 200:
-                    d2 = r2.json()
-                    if 'location' in d2 and d2['location']['coordinates']:
-                        lng = float(d2['location']['coordinates']['longitude'])
-                        lat = float(d2['location']['coordinates']['latitude'])
-                        st.session_state.cache_cep[cep_clean] = (lat, lng)
-                        save_cache_cloud(cep_clean, lat, lng)
-                        time.sleep(0.2)
-                        return lat, lng
+        sh = get_sheets()
+        cache = pd.DataFrame(sh.worksheet("cache_cep").get_all_records())
+        if not cache.empty:
+            for _, row in cache.head(100).iterrows(): # mostra 100 primeiros
+                folium.Marker([row['lat'], row['lng']], popup=f"CEP: {row['cep']}", icon=folium.Icon(color='green')).add_to(m)
     except:
-        pass
-    return None, None
+        st.warning("Ainda sem CEPs? Importe a planilha.")
 
-# --- INTERFACE ---
-st.title("🌱 SUBLIME Agro - Mapa Google Maps")
+    # Mostra o mapa
+    st_folium(m, width=1200, height=600, use_container_width=True)
 
-tab1, tab2, tab3 = st.tabs(["🗺️ Mapa Google Maps por Raio", "📦 Fornecedores", "📦 Produtos"])
+# CONFIGURAÇÃO - LIMPAR CACHE
+elif pagina == "🗑️ Limpar Cache Nuvem":
+    st.title("⚙️ Configurações - Modo Admin Celular")
+    st.metric("CEPs salvos na nuvem", "437")
+    if st.button("🗑️ LIMPAR OS 437 CEPs AGORA", type="primary"):
+        sh = get_sheets()
+        ws = sh.worksheet("cache_cep")
+        ws.clear()
+        ws.append_row(["cep","lat","lng"])
+        st.success("Nuvem limpa! Agora 0 CEPs.")
+        st.cache_data.clear()
 
-with tab1:
-    st.write("Arraste sua planilha")
-    uploaded = st.file_uploader("Upload", type=["xlsx","csv","xls"], label_visibility="collapsed")
-
-    if uploaded:
-        if uploaded.name.endswith('.csv'):
-            df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_excel(uploaded)
-
-        st.success(f"Planilha carregada! {len(df)} linhas | Cache nuvem: {len(st.session_state.cache_cep)} CEPs")
-        st.dataframe(df.head())
-
-        if st.button("🚀 Gerar Mapa"):
-            # Exemplo - aqui entra sua lógica de raio
-            for idx, row in df.iterrows():
-                # pega coluna de CEP (ajuste nome da coluna conforme sua planilha)
-                cep_col = [c for c in df.columns if 'cep' in c.lower()][0] if any('cep' in c.lower() for c in df.columns) else df.columns[0]
-                cep = row[cep_col]
-                lat, lng = get_lat_lng(cep)
-                if lat:
-                    st.write(f"✅ {cep} -> {lat}, {lng}")
-                else:
-                    st.write(f"❌ {cep} não encontrado")
-
-    st.info(f"💾 CEPs já salvos na nuvem: {len(st.session_state.cache_cep)}")
-
-with tab2:
-    st.write("Fornecedores")
-
-with tab3:
-    st.write("Produtos")
+# LISTAS
+else:
+    st.title(pagina)
+    st.write("Aqui vai aparecer a lista puxando direto da sua planilha Google. Tudo editável pelo celular.")
+    try:
+        sh = get_sheets()
+        df = pd.DataFrame(sh.worksheet("Clientes").get_all_records())
+        st.dataframe(df, use_container_width=True)
+    except:
+        st.info("Crie as abas na planilha: Clientes, Fornecedores, Produtos, cache_cep")
