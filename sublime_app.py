@@ -1,59 +1,117 @@
 import streamlit as st
 import pandas as pd
-import math
+import plotly.express as px
+import os
 
-st.set_page_config(page_title="SUBLIME Agro - Prospecção Inteligente", layout="wide")
-st.title("SUBLIME Agro - Prospecção Inteligente")
+st.set_page_config(page_title="SUBLIME Agro - Dashboard Completo", layout="wide")
+st.title("🌱 SUBLIME Agro - Gestão Completa")
 
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371
-    dlat = math.radians(lat2-lat1)
-    dlon = math.radians(lon2-lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
-    return 2*R*math.asin(math.sqrt(a))
+# --- BANCO DE DADOS SIMPLES (salva em CSV no servidor) ---
+FILE_FORN = "fornecedores.csv"
+FILE_PROD = "produtos.csv"
 
-uploaded = st.file_uploader("Arraste sua base.xlsx", type=["xlsx","csv"])
-if uploaded:
-    if uploaded.name.endswith(".csv"):
-        df = pd.read_csv(uploaded)
+def load_forn():
+    if os.path.exists(FILE_FORN):
+        return pd.read_csv(FILE_FORN)
     else:
-        df = pd.read_excel(uploaded)
-    st.success(f"Base carregada: {len(df)} clientes")
+        return pd.DataFrame(columns=["Fornecedor","CNPJ","Cidade","UF","Contato","WhatsApp","Categoria"])
 
-    # Tenta achar coluna de categoria ouro/prata
-    col_cat = None
-    for c in df.columns:
-        if 'categ' in c.lower() or 'ouro' in c.lower() or 'prata' in c.lower() or 'class' in c.lower():
-            col_cat = c
-            break
-
-    if col_cat:
-        df_filt = df[df[col_cat].astype(str).str.upper().str.contains("OURO|PRATA")]
+def load_prod():
+    if os.path.exists(FILE_PROD):
+        return pd.read_csv(FILE_PROD)
     else:
-        df_filt = df # se não achar coluna, usa todos
+        return pd.DataFrame(columns=["Fornecedor","Produto","Categoria_Produto","Preco","Estoque","Obs"])
 
-    st.info(f"Filtrados OURO+PRATA: {len(df_filt)}")
+tab1, tab2, tab3 = st.tabs(["📊 Dashboard Clientes", "🏭 Fornecedores", "📦 Produtos por Fornecedor"])
 
-    cidade = st.text_input("Cidade base", "Lucas do Rio Verde")
-    lat_centro = st.number_input("Lat centro", value=-13.06, format="%.4f")
-    lon_centro = st.number_input("Lon centro", value=-55.90, format="%.4f")
-    raio = st.slider("Raio km", 10, 1000, 500)
+with tab1:
+    uploaded = st.file_uploader("Arraste sua Base de clientes.xlsx", type=["xlsx","csv"], key="cli")
+    if uploaded:
+        df = pd.read_excel(uploaded) if uploaded.name.endswith(".xlsx") else pd.read_csv(uploaded)
+        df.columns = [c.strip().upper() for c in df.columns]
+        st.success(f"Base: {len(df)} clientes")
+        
+        # Procura colunas
+        col_cidade = next((c for c in df.columns if 'CIDADE' in c or 'MUNIC' in c), None)
+        col_cat = next((c for c in df.columns if 'CATEG' in c), None)
+        
+        if col_cidade:
+            top = df[col_cidade].value_counts().head(20).reset_index()
+            top.columns = ['Cidade','Qtd']
+            fig = px.bar(top, x='Cidade', y='Qtd', title="Top Cidades")
+            st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(df.head(500), use_container_width=True)
+    else:
+        st.info("Suba a base de 88k aqui para ver o dashboard")
 
-    if st.button("Gerar Mapa e CSV"):
-        # Se tiver lat/lon na base, filtra por raio. Se não tiver, mostra todos
-        if 'lat' in df_filt.columns or 'latitude' in df_filt.columns or 'LAT' in df_filt.columns:
-            lat_col = [c for c in df_filt.columns if 'lat' in c.lower()][0]
-            lon_col = [c for c in df_filt.columns if 'lon' in c.lower() or 'lng' in c.lower()][0]
-            df_filt['dist'] = df_filt.apply(lambda r: haversine(lat_centro, lon_centro, float(r[lat_col]), float(r[lon_col])), axis=1)
-            df_final = df_filt[df_filt['dist'] <= raio]
+with tab2:
+    st.header("Cadastro de Fornecedores")
+    df_forn = load_forn()
+    
+    with st.form("form_forn", clear_on_submit=True):
+        c1,c2 = st.columns(2)
+        nome = c1.text_input("Nome Fornecedor*")
+        cnpj = c2.text_input("CNPJ")
+        cidade = c1.text_input("Cidade")
+        uf = c2.text_input("UF", max_chars=2)
+        contato = c1.text_input("Contato")
+        zap = c2.text_input("WhatsApp")
+        categ = st.selectbox("O que fornece?", ["Sementes","Fertilizantes","Defensivos","Máquinas","Outros"])
+        if st.form_submit_button("💾 Salvar Fornecedor"):
+            if nome:
+                novo = pd.DataFrame([[nome,cnpj,cidade,uf,contato,zap,categ]], columns=df_forn.columns)
+                df_forn = pd.concat([df_forn, novo], ignore_index=True)
+                df_forn.to_csv(FILE_FORN, index=False)
+                st.success(f"Fornecedor {nome} salvo!")
+                st.rerun()
+            else:
+                st.error("Nome é obrigatório")
+
+    st.divider()
+    st.subheader(f"Fornecedores Cadastrados: {len(df_forn)}")
+    edited_forn = st.data_editor(df_forn, num_rows="dynamic", use_container_width=True, key="edit_forn")
+    if st.button("Salvar alterações na tabela de Fornecedores"):
+        edited_forn.to_csv(FILE_FORN, index=False)
+        st.success("Alterações salvas!")
+
+with tab3:
+    st.header("Quais produtos cada fornecedor fornece")
+    df_forn = load_forn()
+    df_prod = load_prod()
+    
+    if len(df_forn)==0:
+        st.warning("Cadastre primeiro um fornecedor na Aba 2")
+    else:
+        with st.form("form_prod", clear_on_submit=True):
+            forn_sel = st.selectbox("Selecione o Fornecedor", df_forn["Fornecedor"].unique())
+            c1,c2 = st.columns(2)
+            prod = c1.text_input("Produto* (ex: Soja 8473, Ureia 45%)")
+            cat_prod = c2.selectbox("Categoria", ["Semente","Fertilizante","Defensivo","Foliar","Biológico"])
+            preco = c1.text_input("Preço")
+            estoque = c2.text_input("Estoque")
+            obs = st.text_input("Obs")
+            if st.form_submit_button("➕ Vincular Produto ao Fornecedor"):
+                if prod:
+                    novo = pd.DataFrame([[forn_sel,prod,cat_prod,preco,estoque,obs]], columns=df_prod.columns)
+                    df_prod = pd.concat([df_prod, novo], ignore_index=True)
+                    df_prod.to_csv(FILE_PROD, index=False)
+                    st.success(f"{prod} vinculado a {forn_sel}!")
+                    st.rerun()
+
+        st.divider()
+        # Filtro por fornecedor
+        filtro_forn = st.selectbox("Filtrar por fornecedor", ["Todos"] + df_forn["Fornecedor"].tolist())
+        if filtro_forn!="Todos":
+            df_show = df_prod[df_prod["Fornecedor"]==filtro_forn]
         else:
-            st.warning("Sua base não tem latitude/longitude, vou mostrar os primeiros 500 clientes da base como amostra. Me mande as colunas pra eu geocodificar!")
-            df_final = df_filt.head(500)
-
-        if len(df_final)==0:
-            st.error("Nenhum cliente no raio. Aumentei o raio para 1000km automaticamente.")
-            df_final = df_filt.head(1000)
-
-        st.success(f"Clientes no raio: {len(df_final)}")
-        st.dataframe(df_final.head(100))
-        st.download_button("Baixar CSV", df_final.to_csv(index=False).encode('utf-8'), "clientes_filtrados.csv")
+            df_show = df_prod
+            
+        st.dataframe(df_show, use_container_width=True)
+        
+        # Gráfico
+        if len(df_show)>0:
+            fig = px.treemap(df_show, path=['Fornecedor','Produto'], title="Produtos por Fornecedor")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Baixar
+        st.download_button("📥 Baixar lista de produtos", df_prod.to_csv(index=False).encode('utf-8'), "produtos_fornecedores.csv")
