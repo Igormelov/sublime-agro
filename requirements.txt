@@ -1,7 +1,8 @@
 streamlit
 pandas
-gspread
+gspread==6.0.2
+google-auth==2.35.0
+google-auth-oauthlib==1.2.0
 folium
 streamlit-folium
-google-auth
 requests
