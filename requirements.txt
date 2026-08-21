@@ -1,5 +1,6 @@
-pandas
-openpyxl
 streamlit
-folium
-streamlit-folium
+pandas
+plotly
+openpyxl
+gspread
+oauth2client
