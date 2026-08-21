@@ -1,161 +1,131 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import math
-from geopy.geocoders import Nominatim
-import folium
-from streamlit_folium import st_folium
+import requests
+import time
+import gspread
+from google.oauth2.service_account import Credentials
+import json
 
-st.set_page_config(page_title="SUBLIME Agro - Google Maps", layout="wide")
-st.title("🌱 SUBLIME Agro - Mapa Google Maps")
+st.set_page_config(page_title="SUBLIME Agro - Mapa Google Maps", layout="wide")
 
-@st.cache_data(show_spinner=False)
-def geocode_city(cidade, uf=""):
+# --- CONEXÃO COM GOOGLE SHEETS (NUVEM) ---
+@st.cache_resource
+def get_gspread_client():
     try:
-        geolocator = Nominatim(user_agent="sublime_agro_v7")
-        query = f"{cidade}, {uf}, Brasil" if uf else f"{cidade}, Brasil"
-        loc = geolocator.geocode(query, timeout=10)
-        if loc:
-            return loc.latitude, loc.longitude
-    except:
-        pass
-    return None
-
-def haversine(lat1, lon1, lat2, lon2):
-    R=6371
-    dlat=math.radians(lat2-lat1); dlon=math.radians(lon2-lon1)
-    a=math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
-    return 2*R*math.asin(math.sqrt(a))
-
-tab1, tab2, tab3 = st.tabs(["🗺️ Mapa Google Maps por Raio", "🏭 Fornecedores", "📦 Produtos"])
-
-with tab1:
-    up = st.file_uploader("Arraste sua planilha", type=["xlsx","csv","xls"])
-    if not up:
-        st.stop()
-
-    df = pd.read_excel(up, engine='openpyxl') if up.name.endswith((".xlsx",".xls")) else pd.read_csv(up)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    def find_col(nomes):
-        for n in nomes:
-            for c in df.columns:
-                if n in c.upper():
-                    return c
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
         return None
 
-    col_cidade = find_col(["MUNC", "CIDADE"])
-    col_uf = find_col(["ESTC", "UF", "ESTADO"])
-    col_nome = find_col(["NOME", "CLIENTE"])
-    col_cat = find_col(["SEGMENTO", "CATEGORIA", "OURO", "PRATA"])
+def load_cache_cloud():
+    try:
+        client = get_gspread_client()
+        if not client: return {}
+        sheet_id = st.secrets["gcp"]["spreadsheet_id"]
+        sh = client.open_by_key(sheet_id)
+        try:
+            ws = sh.worksheet("cache_cep")
+        except:
+            ws = sh.add_worksheet(title="cache_cep", rows=1000, cols=3)
+            ws.append_row(["cep", "lat", "lng"])
+            return {}
 
-    st.success(f"Base: {len(df)} | Cidade: {col_cidade} | Categoria: {col_cat}")
+        data = ws.get_all_records()
+        cache = {}
+        for row in data:
+            try:
+                cache[str(row['cep']).replace('-','').strip()] = (float(row['lat']), float(row['lng']))
+            except: pass
+        return cache
+    except Exception as e:
+        st.warning(f"Cache nuvem offline: {e}")
+        return {}
 
-    st.sidebar.header("Filtros")
-    df_f = df.copy()
-    if col_cat:
-        cats = df[col_cat].astype(str).unique().tolist()
-        sel = st.sidebar.multiselect(f"Categoria ({col_cat})", cats, default=cats)
-        if sel:
-            df_f = df_f[df_f[col_cat].isin(sel)]
+def save_cache_cloud(cep, lat, lng):
+    try:
+        client = get_gspread_client()
+        if not client: return
+        sheet_id = st.secrets["gcp"]["spreadsheet_id"]
+        sh = client.open_by_key(sheet_id)
+        ws = sh.worksheet("cache_cep")
+        cep_clean = str(cep).replace('-','').strip()
+        ws.append_row([cep_clean, lat, lng])
+    except Exception as e:
+        pass
 
-    cidades_unicas = sorted(df_f[col_cidade].dropna().astype(str).unique().tolist())
-    cidade_base = st.sidebar.selectbox("📍 Cidade Base", cidades_unicas, index=cidades_unicas.index("DIVINOPOLIS") if "DIVINOPOLIS" in cidades_unicas else 0)
-    raio = st.sidebar.slider("📏 Raio KM", 10, 1000, 300, 10)
+# Carrega cache da nuvem
+if 'cache_cep' not in st.session_state:
+    with st.spinner("Carregando cache da nuvem..."):
+        st.session_state.cache_cep = load_cache_cloud()
 
-    if st.sidebar.button("🔍 Buscar Cidades no Raio"):
-        with st.spinner(f"Geocodificando {cidade_base} e {len(cidades_unicas)} cidades via Google/OpenStreetMap..."):
-            uf_base = df_f[df_f[col_cidade]==cidade_base][col_uf].iloc[0] if col_uf else ""
-            coord_base = geocode_city(cidade_base, uf_base)
+# --- FUNÇÃO DE BUSCAR LAT/LNG DO CEP ---
+def get_lat_lng(cep):
+    cep_clean = str(cep).replace('-','').replace('.','').strip()
+    if len(cep_clean)!= 8:
+        return None, None
 
-            if not coord_base:
-                st.error(f"Não achei {cidade_base} no mapa. Tente escrever com UF.")
-                st.stop()
+    # 1. Tenta cache
+    if cep_clean in st.session_state.cache_cep:
+        return st.session_state.cache_cep[cep_clean]
 
-            st.session_state["coord_base"] = coord_base
-            st.session_state["cidade_base"] = cidade_base
+    # 2. Busca na API ViaCEP + BrasilAPI
+    try:
+        r = requests.get(f"https://viacep.com.br/ws/{cep_clean}/json/", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if 'erro' not in data:
+                # Usa BrasilAPI para geocode
+                r2 = requests.get(f"https://brasilapi.com.br/api/cep/v2/{cep_clean}", timeout=5)
+                if r2.status_code == 200:
+                    d2 = r2.json()
+                    if 'location' in d2 and d2['location']['coordinates']:
+                        lng = float(d2['location']['coordinates']['longitude'])
+                        lat = float(d2['location']['coordinates']['latitude'])
+                        st.session_state.cache_cep[cep_clean] = (lat, lng)
+                        save_cache_cloud(cep_clean, lat, lng)
+                        time.sleep(0.2)
+                        return lat, lng
+    except:
+        pass
+    return None, None
 
-            dist_map = {}
-            coords_map = {cidade_base: coord_base}
-            for cid in cidades_unicas:
-                uf_cid = df_f[df_f[col_cidade]==cid][col_uf].iloc[0] if col_uf else ""
-                coord = geocode_city(cid, uf_cid)
-                if coord:
-                    coords_map[cid] = coord
-                    d = haversine(coord_base[0], coord_base[1], coord[0], coord[1])
-                    dist_map[cid] = d
+# --- INTERFACE ---
+st.title("🌱 SUBLIME Agro - Mapa Google Maps")
 
-            st.session_state["dist_map"] = dist_map
-            st.session_state["coords_map"] = coords_map
-            st.success(f"Encontradas {len(dist_map)} cidades com coordenadas!")
+tab1, tab2, tab3 = st.tabs(["🗺️ Mapa Google Maps por Raio", "📦 Fornecedores", "📦 Produtos"])
 
-    if "dist_map" in st.session_state:
-        dist_map = st.session_state["dist_map"]
-        coords_map = st.session_state["coords_map"]
-        coord_base = st.session_state["coord_base"]
-        cidade_base = st.session_state["cidade_base"]
+with tab1:
+    st.write("Arraste sua planilha")
+    uploaded = st.file_uploader("Upload", type=["xlsx","csv","xls"], label_visibility="collapsed")
 
-        cidades_no_raio = [c for c,d in dist_map.items() if d <= raio]
-        df_final = df_f[df_f[col_cidade].astype(str).isin(cidades_no_raio)].copy()
-        df_final["KM_DA_BASE"] = df_final[col_cidade].apply(lambda x: dist_map.get(x, 0))
+    if uploaded:
+        if uploaded.name.endswith('.csv'):
+            df = pd.read_csv(uploaded)
+        else:
+            df = pd.read_excel(uploaded)
 
-        c1,c2,c3,c4 = st.columns(4)
-        c1.metric("Clientes no Raio", len(df_final))
-        c2.metric("Cidades no Raio", len(cidades_no_raio))
-        c3.metric("Cidade Base", cidade_base)
-        c4.metric("Raio", f"{raio} km")
+        st.success(f"Planilha carregada! {len(df)} linhas | Cache nuvem: {len(st.session_state.cache_cep)} CEPs")
+        st.dataframe(df.head())
 
-        # --- MAPA GOOGLE MAPS DE VERDADE ---
-        st.subheader(f"🗺️ Mapa - {len(cidades_no_raio)} cidades dentro de {raio}km de {cidade_base}")
+        if st.button("🚀 Gerar Mapa"):
+            # Exemplo - aqui entra sua lógica de raio
+            for idx, row in df.iterrows():
+                # pega coluna de CEP (ajuste nome da coluna conforme sua planilha)
+                cep_col = [c for c in df.columns if 'cep' in c.lower()][0] if any('cep' in c.lower() for c in df.columns) else df.columns[0]
+                cep = row[cep_col]
+                lat, lng = get_lat_lng(cep)
+                if lat:
+                    st.write(f"✅ {cep} -> {lat}, {lng}")
+                else:
+                    st.write(f"❌ {cep} não encontrado")
 
-        # Cria mapa Folium com estilo Google Maps
-        m = folium.Map(location=coord_base, zoom_start=8, tiles="OpenStreetMap")
-
-        # Marcador da cidade base em vermelho
-        folium.Marker(
-            coord_base,
-            popup=f"<b>BASE: {cidade_base}</b>",
-            icon=folium.Icon(color="red", icon="home")
-        ).add_to(m)
-
-        # Marcadores das cidades no raio
-        for cid in cidades_no_raio:
-            if cid == cidade_base: continue
-            if cid in coords_map:
-                coord = coords_map[cid]
-                qtd = len(df_final[df_final[col_cidade]==cid])
-                folium.Marker(
-                    coord,
-                    popup=f"<b>{cid}</b><br>{qtd} clientes<br>{dist_map[cid]:.0f}km da base",
-                    icon=folium.Icon(color="blue", icon="user")
-                ).add_to(m)
-
-        # Círculo do raio
-        folium.Circle(
-            coord_base,
-            radius=raio*1000,
-            color="red",
-            fill=True,
-            fill_opacity=0.1
-        ).add_to(m)
-
-        # Mostra o mapa
-        st_folium(m, width=1200, height=600)
-
-        # Link para abrir no Google Maps de verdade
-        st.markdown("### 📱 Abrir no Google Maps")
-        st.markdown(f"[🔗 Abrir {cidade_base} no Google Maps](https://www.google.com/maps/search/?api=1&query={cidade_base})")
-        # Link com todas as cidades
-        for cid in cidades_no_raio[:5]:
-            st.markdown(f"[📍 Ver clientes em {cid} no Google Maps](https://www.google.com/maps/search/?api=1&query={cid})")
-
-        st.divider()
-        st.dataframe(df_final, use_container_width=True, height=500)
-        st.download_button("📥 Baixar CSV", df_final.to_csv(index=False).encode('utf-8'), f"clientes_{cidade_base}_{raio}km.csv")
+    st.info(f"💾 CEPs já salvos na nuvem: {len(st.session_state.cache_cep)}")
 
 with tab2:
-    st.header("Fornecedores")
-    st.info("Cadastro de fornecedores - em breve com Google Sheets")
+    st.write("Fornecedores")
 
 with tab3:
-    st.header("Produtos por Fornecedor")
+    st.write("Produtos")
